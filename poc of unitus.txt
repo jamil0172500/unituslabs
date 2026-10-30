@@ -1,0 +1,98 @@
+Title: Critical: Missing Price Oracle Integration in beforeBorrow Allows Bypassing Segregation Mode Debt Ceiling
+
+Project: Unitus Labs
+Severity: Critical / High
+Vulnerability Type: Logic Error / Oracle Failure
+
+1. DESCRIPTION
+In the ControllerV2ExtraExplicit.sol contract, the beforeBorrow function calculates the currentDebt for Segregation Mode. However, the calculation completely ignores the price of the underlying asset. It merely normalizes the _borrowAmount using the token's decimals (DEBT_CEILING_DECIMALS), which is set to 2 in ControllerStorage.sol.
+
+Because the asset's USD value is not factored in, borrowing a highly valuable asset (like WBTC or ETH) adds the exact same amount to currentDebt as borrowing a low-value asset (like USDC). 
+
+2. VULNERABLE CODE SNIPPET
+File: src/ControllerV2ExtraExplicit.sol (Lines 209-211)
+
+uint256 _newDebt = collateralMarket.currentDebt.add(
+    _borrowAmount.div(
+        10 ** (_getDecimals(_iToken).sub(DEBT_CEILING_DECIMALS))
+    )
+);
+
+(Note: No IPriceOracle.getUnderlyingPrice() is called here to calculate the actual USD value).
+
+3. IMPACT
+An attacker can easily bypass the debtCeiling limit in Segregation Mode. By borrowing high-value assets (e.g., 1 WBTC = ~$60,000), the attacker can accumulate massive real-world debt while the protocol's currentDebt state variable barely increases. This leads to a complete drainage of the protocol's liquidity and results in massive bad debt (insolvency).
+
+4. PROOF OF CONCEPT (PoC)
+I have simulated the exact math logic from the smart contract in a Node.js environment to prove the vulnerability.
+
+Step 1: The Script (poc.js)
+--------------------------------------------------
+function calculateNewDebt(tokenName, borrowAmount, decimals) {
+    const DEBT_CEILING_DECIMALS = 2; // As per ControllerStorage.sol
+    
+    console.log(`\n--- Testing ${tokenName} ---`);
+    console.log(`Borrow Amount: ${borrowAmount} (${borrowAmount / (10 ** decimals)} tokens)`);
+    console.log(`Token Decimals: ${decimals}`);
+    
+    let divisor = 10n ** BigInt(decimals - DEBT_CEILING_DECIMALS);
+    let normalizedAmount = BigInt(borrowAmount) / divisor;
+    
+    console.log(`Impact on currentDebt: +${normalizedAmount}`);
+    return normalizedAmount;
+}
+
+// Scenario 1: Borrowing 1 USDC (Price: ~$1, Decimals: 6)
+const usdcBorrowAmount = 1000000; 
+let usdcDebtImpact = calculateNewDebt("USDC", usdcBorrowAmount, 6);
+
+// Scenario 2: Borrowing 1 WBTC (Price: ~$60,000, Decimals: 8)
+const wbtcBorrowAmount = 100000000; 
+let wbtcDebtImpact = calculateNewDebt("WBTC", wbtcBorrowAmount, 8);
+
+// Conclusion
+console.log("\n=========================================================");
+console.log("💡 CONCLUSION:");
+if (usdcDebtImpact === wbtcDebtImpact) {
+    console.log("🚨 VULNERABILITY PROVEN!");
+    console.log(`Borrowing 1 USDC ($1) and 1 WBTC ($60,000) both add EXACTLY +${usdcDebtImpact} to currentDebt!`);
+    console.log("The protocol fails to multiply the amount by the asset's USD price.");
+    console.log("An attacker can drain the debt ceiling by borrowing high-value assets.");
+}
+console.log("=========================================================");
+--------------------------------------------------
+
+Step 2: Terminal Execution Output
+--------------------------------------------------
+--- Testing USDC ---
+Borrow Amount: 1000000 (1 tokens)
+Token Decimals: 6
+Impact on currentDebt: +100
+
+--- Testing WBTC ---
+Borrow Amount: 100000000 (1 tokens)
+Token Decimals: 8
+Impact on currentDebt: +100
+
+=========================================================
+💡 CONCLUSION:
+🚨 VULNERABILITY PROVEN!
+Borrowing 1 USDC ($1) and 1 WBTC ($60,000) both add EXACTLY +100 to currentDebt!
+The protocol fails to multiply the amount by the asset's USD price.
+An attacker can drain the debt ceiling by borrowing high-value assets.
+=========================================================
+--------------------------------------------------
+
+5. RECOMMENDED MITIGATION
+The beforeBorrow and afterRepayBorrow functions must integrate with the IPriceOracle to fetch the true USD value of the borrowed asset before updating the currentDebt.
+
+Proposed Fix:
+--------------------------------------------------
+uint256 price = IPriceOracle(priceOracle).getUnderlyingPrice(_iToken);
+uint256 usdValue = _borrowAmount.mul(price).div(1e18); // Get USD value
+
+// Then normalize and add usdValue to currentDebt instead of raw _borrowAmount
+uint256 _newDebt = collateralMarket.currentDebt.add(
+    usdValue.div(10 ** DEBT_CEILING_DECIMALS) 
+);
+--------------------------------------------------
